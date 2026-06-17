@@ -289,6 +289,254 @@ function downloadBlob(filename,text,type){const blob=new Blob([text],{type:type|
 async function exportFilesMeta(){const files=await dbGetAll('files'); exportCSV(files.map(({blob,...f})=>f),'asset_file_metadata_v6.csv')}
 function exportModuleStatus(){const db=getModuleDB(); exportCSV(modules.map(m=>({module:m.name,status:db[m.id]?.status||'On Progress',checks:(db[m.id]?.checks||[]).map(c=>`${c.name}:${c.status}`).join('; ')})),'module_readiness_v6.csv')}
 async function exportFeedbackCSV(){const data=await dbGetAll('feedback'); exportCSV(data,'feedback_v8.csv')} async function exportFeedbackJSON(){const data=await dbGetAll('feedback'); downloadBlob('feedback_v8.json',JSON.stringify(data,null,2),'application/json')}
+
+/* === GeoPlatform Visual Asset & Data Hub FIX v10 === */
+const ASSET_API_BASE = '/.netlify/functions/google-api';
+const ASSET_DRIVE_ROOT_URL = 'https://drive.google.com/drive/folders/1XAVysgF3PeF0rd84BsYUtOxc3OP0wla4';
+const ASSET_MAX_UPLOAD_MB = 12;
+let liveAssetFileCache = [];
+let liveAssetLastLoaded = 0;
+
+const assetNameMap = {
+  'WA/Email Prompt': 'WA & Email Outreach Prompt Pack',
+  'WA Email Prompt': 'WA & Email Outreach Prompt Pack',
+  'Product One-Pager': 'Product One-Pager',
+  'Mini Deck': 'Mini Product Deck',
+  'Module Sheet': 'Module Sheet',
+  'Use Case Sheet': 'Government GeoPlatform Use Case Sheet',
+  'Proposal Skeleton': 'Proposal Skeleton',
+  'Visual Mockup': 'Visual Mockup Library',
+  'Case Study Proof': 'Proof & Case Study Card Library',
+  'General Asset': 'General Asset'
+};
+
+function assetUrl(action, params) {
+  const q = new URLSearchParams(params || {});
+  q.set('action', action);
+  return ASSET_API_BASE + '?' + q.toString();
+}
+
+async function assetGet(action, params) {
+  const res = await fetch(assetUrl(action, params || {}), { method: 'GET' });
+  const text = await res.text();
+  try { return JSON.parse(text); } catch (err) { return { ok: false, error: 'Invalid JSON response', raw: text }; }
+}
+
+async function assetPost(action, payload) {
+  const res = await fetch(assetUrl(action, {}), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({ action: action }, payload || {}))
+  });
+  const text = await res.text();
+  try { return JSON.parse(text); } catch (err) { return { ok: false, error: 'Invalid JSON response', raw: text }; }
+}
+
+async function getLiveAssetFiles(force) {
+  const now = Date.now();
+  if (!force && liveAssetFileCache.length && (now - liveAssetLastLoaded < 20000)) {
+    return liveAssetFileCache;
+  }
+  const api = await assetGet('getDriveFiles', { maxDepth: 8, t: Date.now() });
+  if (!api.ok) {
+    console.error('getDriveFiles failed', api);
+    const local = await dbGetAll('files').catch(function(){ return []; });
+    liveAssetFileCache = local.map(function(f){ return Object.assign({ source: 'Local Browser' }, f); });
+    liveAssetLastLoaded = now;
+    return liveAssetFileCache;
+  }
+  const rows = api.data && api.data.rows ? api.data.rows : [];
+  liveAssetFileCache = rows.map(mapDriveAssetFile);
+  liveAssetLastLoaded = now;
+  return liveAssetFileCache;
+}
+
+function mapDriveAssetFile(f) {
+  const category = f.category || inferAssetCategory(f.folderPath || '', f.name || '');
+  const asset = assetNameMap[category] || category || 'General Asset';
+  const folderPath = f.folderPath || '';
+  const usecase = inferUseCase(folderPath + ' ' + (f.name || '') + ' ' + asset);
+  return {
+    id: f.fileId || f.id || ('drive_' + Math.random().toString(36).slice(2)),
+    fileId: f.fileId || f.id || '',
+    name: f.name || 'Untitled file',
+    asset: asset,
+    category: category,
+    usecase: usecase,
+    status: 'Drive Ready',
+    source: 'Google Drive',
+    url: f.url || '',
+    downloadUrl: f.downloadUrl || f.url || '',
+    folderPath: folderPath,
+    type: f.mimeType || '',
+    mimeType: f.mimeType || '',
+    size: Number(f.sizeBytes || f.size || 0),
+    created: f.updatedAt || f.created || new Date().toISOString(),
+    updatedAt: f.updatedAt || ''
+  };
+}
+
+function inferAssetCategory(text, name) {
+  const t = String(text + ' ' + name).toLowerCase();
+  if (t.includes('one') || t.includes('pager')) return 'Product One-Pager';
+  if (t.includes('deck')) return 'Mini Deck';
+  if (t.includes('module')) return 'Module Sheet';
+  if (t.includes('use') || t.includes('case')) return 'Use Case Sheet';
+  if (t.includes('proposal')) return 'Proposal Skeleton';
+  if (t.includes('wa') || t.includes('whatsapp') || t.includes('email') || t.includes('prompt')) return 'WA/Email Prompt';
+  if (t.includes('visual') || t.includes('mockup') || t.includes('screenshot') || t.includes('figma') || t.includes('png') || t.includes('jpg')) return 'Visual Mockup';
+  if (t.includes('proof') || t.includes('case study')) return 'Case Study Proof';
+  return 'General Asset';
+}
+
+function inferUseCase(text) {
+  const t = String(text || '').toLowerCase();
+  if (t.includes('environment') || t.includes('lingkungan') || t.includes('dlh') || t.includes('klhk')) return 'Environmental Monitoring';
+  if (t.includes('portal') || t.includes('satu data') || t.includes('public')) return 'Public Data Portal';
+  if (t.includes('government') || t.includes('gov') || t.includes('bappeda') || t.includes('pemda') || t.includes('geoportal')) return 'Government GeoPlatform';
+  return 'All';
+}
+
+function assetMatch(file, assetName) {
+  if (!assetName || assetName === 'All') return true;
+  if (file.asset === assetName) return true;
+  if (file.category === assetName) return true;
+  const a = String(assetName).toLowerCase();
+  const hay = String(file.asset + ' ' + file.category + ' ' + file.folderPath + ' ' + file.name).toLowerCase();
+  if (a.includes('wa') && (hay.includes('wa') || hay.includes('whatsapp') || hay.includes('email') || hay.includes('prompt'))) return true;
+  if (a.includes('one') && (hay.includes('one') || hay.includes('pager'))) return true;
+  if (a.includes('deck') && hay.includes('deck')) return true;
+  if (a.includes('module') && hay.includes('module')) return true;
+  if (a.includes('use case') && (hay.includes('use') || hay.includes('case'))) return true;
+  if (a.includes('visual') && (hay.includes('visual') || hay.includes('mockup'))) return true;
+  if (a.includes('proof') && (hay.includes('proof') || hay.includes('case study'))) return true;
+  return false;
+}
+
+async function renderAssets(forceReload) {
+  const target = $('assets');
+  if (!target) return;
+  target.innerHTML = '<div class="panel"><div class="panel-title"><h2>Visual Asset & Data Hub</h2><span class="tag blue">Loading Google Drive...</span></div><p class="hint">Mengambil file template dari Google Drive Repository melalui Apps Script.</p></div>';
+  const files = await getLiveAssetFiles(!!forceReload);
+  const types = ['All'].concat(unique(baseAssets.map(function(a){ return a.name; })));
+  const uses = ['All'].concat(unique(baseAssets.map(function(a){ return a.usecase; }).concat(files.map(function(f){ return f.usecase; }))));
+  const filtered = files.filter(function(f){
+    return (!state.assetFilterType || state.assetFilterType === 'All' || assetMatch(f, state.assetFilterType)) &&
+      (!state.assetFilterUse || state.assetFilterUse === 'All' || f.usecase === state.assetFilterUse || f.usecase === 'All');
+  });
+  target.innerHTML = '<div class="subtabs"><button class="' + (state.assetTab === 'templates' ? 'active' : '') + '" onclick="state.assetTab=\'templates\';renderAssets()">Asset Hub</button><button class="' + (state.assetTab === 'database' ? 'active' : '') + '" onclick="state.assetTab=\'database\';renderAssets()">File Database</button><button class="' + (state.assetTab === 'prompt' ? 'active' : '') + '" onclick="state.assetTab=\'prompt\';renderAssets()">Prompt Generator</button></div>' + (state.assetTab === 'templates' ? assetTemplateView(files) : state.assetTab === 'database' ? assetDatabaseView(filtered, types, uses) : assetPromptView());
+}
+
+function assetTemplateView(files) {
+  return '<div class="panel"><div class="panel-title"><h2>Visual Asset & Data Hub</h2><div class="quick-actions"><button class="btn sm" onclick="renderAssets(true)">Refresh Drive</button><a class="btn sm blue" target="_blank" href="' + ASSET_DRIVE_ROOT_URL + '">Open Drive Repository</a></div></div><p class="hint">Asset Hub sekarang membaca Google Drive Repository. Upload template bisa dilakukan dari tombol Upload Template. File yang sudah masuk akan tampil di File Database dan dapat dibuka/download.</p></div><div class="grid cols-2" style="margin-top:18px">' + baseAssets.map(function(a){
+    const count = files.filter(function(f){ return assetMatch(f, a.name); }).length;
+    const readyLabel = count > 0 ? 'Drive Ready' : a.status;
+    const progress = Math.max(a.progress || 0, count > 0 ? 65 : 0);
+    return '<div class="asset-card"><div class="panel-title"><h3>' + esc(a.name) + '</h3><span class="tag ' + (a.priority.includes('Sangat') ? 'red' : 'amber') + '">' + esc(a.priority) + '</span></div><p class="hint">' + esc(a.brief) + '</p><div class="asset-meta"><span class="tag blue">' + esc(a.stage) + '</span><span class="tag purple">' + esc(a.usecase) + '</span><span class="tag amber">' + esc(readyLabel) + '</span></div><div class="progress"><span style="width:' + progress + '%"></span></div><p class="small">Template uploaded di Drive: <b>' + count + '</b></p><div class="quick-actions"><button class="btn sm blue" onclick="showUploadAsset(\'' + jsEsc(a.name) + '\',\'' + jsEsc(a.usecase) + '\')">Upload Template</button><button class="btn sm" onclick="state.assetFilterType=\'' + jsEsc(a.name) + '\';state.assetTab=\'database\';renderAssets(true)">Lihat File</button><button class="btn sm" onclick="generateAssetPrompt(\'' + jsEsc(a.id) + '\')">Generate Prompt</button></div><div>' + (a.visuals || []).slice(0,5).map(function(v){ return '<span class="tag blue">' + esc(v) + '</span>'; }).join('') + '</div></div>';
+  }).join('') + '</div>';
+}
+
+function assetDatabaseView(files, types, uses) {
+  return '<div class="panel"><div class="panel-title"><h2>File Template Database</h2><div class="quick-actions"><button class="btn sm blue" onclick="showUploadAsset()">Upload File</button><button class="btn sm" onclick="renderAssets(true)">Refresh Drive</button><button class="btn sm" onclick="exportFilesMeta()">Export Metadata CSV</button></div></div><div class="controls"><div class="control"><label>Asset</label><select onchange="state.assetFilterType=this.value;renderAssets()">' + types.map(function(t){ return '<option ' + (state.assetFilterType === t ? 'selected' : '') + '>' + esc(t) + '</option>'; }).join('') + '</select></div><div class="control"><label>Use Case</label><select onchange="state.assetFilterUse=this.value;renderAssets()">' + uses.map(function(t){ return '<option ' + (state.assetFilterUse === t ? 'selected' : '') + '>' + esc(t) + '</option>'; }).join('') + '</select></div></div></div><div class="panel" style="margin-top:18px"><div class="file-row head"><div>File</div><div>Asset</div><div>Use Case</div><div>Status</div><div>Aksi</div></div>' + (files.length ? files.map(function(f){
+    const sizeKb = f.size ? (f.size/1024).toFixed(1) + ' KB' : '-';
+    return '<div class="file-row"><div><b>' + esc(f.name) + '</b><br><span class="hint">' + esc(f.source || 'Google Drive') + ' · ' + sizeKb + '<br>' + esc(f.folderPath || '') + '</span></div><div>' + esc(f.asset) + '</div><div>' + esc(f.usecase) + '</div><div><span class="tag blue">' + esc(f.status || 'Ready') + '</span></div><div class="quick-actions"><button class="btn sm blue" onclick="openAssetFile(\'' + jsEsc(f.id) + '\')">Open</button><button class="btn sm" onclick="downloadStoredFile(\'' + jsEsc(f.id) + '\')">Download</button><button class="btn sm" onclick="copyAssetLink(\'' + jsEsc(f.id) + '\')">Copy Link</button><button class="btn sm" onclick="generatePromptFromAssetFile(\'' + jsEsc(f.id) + '\')">Prompt</button></div></div>';
+  }).join('') : '<div class="empty">Belum ada file di filter ini. Upload file ke Google Drive Repository atau klik Upload File.</div>') + '</div>';
+}
+
+function assetPromptView() {
+  return '<div class="grid cols-2"><div class="panel"><div class="panel-title"><h2>Prompt Generator per Asset</h2><button class="btn sm" onclick="renderAssets(true)">Refresh Drive</button></div><p class="hint">Pilih asset lalu generate prompt brief/copy/desain. File template tetap tersimpan di Google Drive Repository.</p>' + baseAssets.map(function(a){ return '<div class="scenario-card"><div class="panel-title"><h3>' + esc(a.name) + '</h3><button class="btn sm blue" onclick="generateAssetPrompt(\'' + jsEsc(a.id) + '\')">Generate</button></div><p class="hint">' + esc(a.brief) + '</p></div>'; }).join('') + '</div><div class="panel"><div class="panel-title"><h2>Catatan Strategis Asset</h2></div><p>Asset Hub menjadi repository template yang bisa dipakai ulang untuk mitra berbeda. File fisik berada di Google Drive, metadata dibaca dari Apps Script, dan prompt generator dipakai untuk membuat brief produksi atau copy outreach.</p></div></div>';
+}
+
+function showUploadAsset(assetName, usecase) {
+  const selectedAsset = assetName || state.assetFilterType || 'Product One-Pager';
+  const selectedUse = usecase || state.assetFilterUse || 'All';
+  showModal('<div class="panel-title"><h2>Upload Template ke Google Drive</h2><button class="close" onclick="closeModal()">×</button></div><p class="hint">File akan dikirim ke Apps Script lalu disimpan di Google Drive Repository. Metadata juga dicatat ke tab Asset Repository di Google Sheet.</p><div class="grid cols-2" style="margin-top:14px"><div class="control"><label>Asset Type</label><select id="assetUploadType">' + baseAssets.map(function(a){ return '<option ' + (a.name === selectedAsset ? 'selected' : '') + '>' + esc(a.name) + '</option>'; }).join('') + '</select></div><div class="control"><label>Use Case</label><select id="assetUploadUsecase">' + unique(['All','Government GeoPlatform','Environmental Monitoring','Public Data Portal'].concat(baseAssets.map(function(a){return a.usecase;}))).map(function(u){ return '<option ' + (u === selectedUse ? 'selected' : '') + '>' + esc(u) + '</option>'; }).join('') + '</select></div><div class="control"><label>Status</label><select id="assetUploadStatus"><option>Uploaded</option><option>Draft</option><option>Ready</option><option>Needs Review</option><option>Final</option></select></div><div class="control"><label>Owner</label><select id="assetUploadOwner"><option>Design Development</option><option>GISolution</option><option>Technical Development</option><option>Marketing/Sales</option><option>GISACT Team</option></select></div><div class="control" style="grid-column:1/-1"><label>File</label><input id="assetUploadFile" type="file"><span class="hint">Maksimum disarankan ' + ASSET_MAX_UPLOAD_MB + ' MB per file. Untuk file besar, upload langsung via Drive.</span></div></div><div class="quick-actions" style="margin-top:16px"><button id="assetUploadBtn" class="btn blue" onclick="uploadSelectedAssetToDrive()">Upload ke Drive</button><a class="btn" target="_blank" href="' + ASSET_DRIVE_ROOT_URL + '">Upload Manual di Drive</a><button class="btn" onclick="closeModal()">Cancel</button></div><div id="assetUploadStatusBox" class="hint" style="margin-top:12px"></div>');
+}
+
+async function uploadSelectedAssetToDrive() {
+  const input = $('assetUploadFile');
+  const statusBox = $('assetUploadStatusBox');
+  const btn = $('assetUploadBtn');
+  if (!input || !input.files || !input.files[0]) { alert('Pilih file dulu.'); return; }
+  const file = input.files[0];
+  if (file.size > ASSET_MAX_UPLOAD_MB * 1024 * 1024) {
+    alert('File terlalu besar untuk upload lewat web. Upload manual ke Google Drive, lalu klik Refresh Drive.');
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = 'Uploading...';
+  statusBox.textContent = 'Membaca file dan mengirim ke Google Drive...';
+  try {
+    const dataUrl = await readFileAsDataURL(file);
+    const payload = {
+      fileName: file.name,
+      mimeType: file.type || 'application/octet-stream',
+      base64: dataUrl,
+      asset: $('assetUploadType').value,
+      usecase: $('assetUploadUsecase').value,
+      status: $('assetUploadStatus').value,
+      owner: $('assetUploadOwner').value
+    };
+    const res = await assetPost('uploadDriveFile', payload);
+    if (!res.ok) throw new Error(res.error || 'Upload failed');
+    statusBox.innerHTML = '<span class="tag green">Upload berhasil</span> <a target="_blank" href="' + esc(res.data.url || '#') + '">Buka file</a>';
+    state.assetTab = 'database';
+    state.assetFilterType = payload.asset;
+    setTimeout(function(){ closeModal(); renderAssets(true); }, 900);
+  } catch (err) {
+    statusBox.innerHTML = '<span class="tag red">Upload gagal</span> ' + esc(err.message || String(err)) + '<br><span class="hint">Pastikan Apps Script sudah diganti ke versi WITH_ASSET_UPLOAD dan dideploy ulang.</span>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Upload ke Drive';
+  }
+}
+
+function readFileAsDataURL(file) {
+  return new Promise(function(resolve, reject) {
+    const reader = new FileReader();
+    reader.onload = function(){ resolve(String(reader.result || '')); };
+    reader.onerror = function(){ reject(reader.error || new Error('FileReader error')); };
+    reader.readAsDataURL(file);
+  });
+}
+
+function openAssetFile(id) {
+  const f = liveAssetFileCache.find(function(x){ return x.id === id || x.fileId === id; });
+  if (f && f.url) window.open(f.url, '_blank');
+}
+
+function downloadStoredFile(id) {
+  const f = liveAssetFileCache.find(function(x){ return x.id === id || x.fileId === id; });
+  if (f && (f.downloadUrl || f.url)) window.open(f.downloadUrl || f.url, '_blank');
+}
+
+function copyAssetLink(id) {
+  const f = liveAssetFileCache.find(function(x){ return x.id === id || x.fileId === id; });
+  if (!f) return;
+  navigator.clipboard.writeText(f.url || f.downloadUrl || '').then(function(){ alert('Link copied'); });
+}
+
+function generatePromptFromAssetFile(id) {
+  const f = liveAssetFileCache.find(function(x){ return x.id === id || x.fileId === id; });
+  if (!f) return;
+  const prompt = 'Anda adalah product marketing strategist GISACT. Gunakan file asset berikut sebagai konteks untuk membuat materi outreach GeoPlatform.\n\nFile: ' + f.name + '\nAsset: ' + f.asset + '\nUse Case: ' + f.usecase + '\nFolder: ' + f.folderPath + '\nLink: ' + f.url + '\n\nOutputkan:\n1. Ringkasan fungsi file ini untuk outreach.\n2. Kapan file ini dikirim ke calon mitra.\n3. Pesan WhatsApp/email pengantar file.\n4. Follow-up setelah file dikirim.\n5. Checklist feedback yang perlu dicatat.';
+  showModal('<div class="panel-title"><h2>Prompt dari File Asset</h2><button class="close" onclick="closeModal()">×</button></div><textarea id="assetFilePrompt" class="promptbox">' + esc(prompt) + '</textarea><div class="quick-actions" style="margin-top:14px"><button class="btn blue" onclick="copyPromptArea(\'assetFilePrompt\')">Copy Prompt</button><a class="btn" target="_blank" href="' + esc(f.url || '#') + '">Open File</a></div>');
+}
+
+async function exportFilesMeta() {
+  const files = await getLiveAssetFiles(true);
+  exportCSV(files.map(function(f){ return { name: f.name, asset: f.asset, usecase: f.usecase, status: f.status, url: f.url, downloadUrl: f.downloadUrl, folderPath: f.folderPath, size: f.size, updatedAt: f.updatedAt, source: f.source }; }), 'asset_file_metadata_drive.csv');
+}
+
+function esc(x) {
+  return String(x === undefined || x === null ? '' : x).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; });
+}
+
+function jsEsc(x) {
+  return String(x === undefined || x === null ? '' : x).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, ' ');
+}
+/* === End Asset Hub FIX v10 === */
+
 function init(){initNav();renderDashboard();renderScoring();renderScenario();renderCampaign();renderModules();renderAssets();renderPipeline();renderFeedback();renderDatabase()} init();
 </script>
 </body>
